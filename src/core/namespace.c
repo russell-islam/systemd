@@ -1126,7 +1126,70 @@ static int mount_image(const MountEntry *m, const char *root_directory) {
         return 1;
 }
 
-static int mount_overlay(const MountEntry *m) {
+static int apply_one_mount(const char *root_directory, MountEntry *m, const NamespaceInfo *ns_info);
+
+static int overlay_shallow_fallback(const char *sources, const char *where, const NamespaceInfo *ns_info) {
+        _cleanup_strv_free_ char **extensions = NULL;
+        char **extension;
+        int r;
+
+        assert(sources);
+        assert(where);
+
+        extensions = strv_split(sources, ":");
+        if (!extensions)
+                return -ENOMEM;
+
+        /* Remove the root (last element) as it's already mounted */
+        extensions = strv_remove(extensions, where);
+
+        /* Overlay lowerdirs are listed in 'reverse' order, so go backwards */
+        STRV_FOREACH_BACKWARDS(extension, extensions) {
+                _cleanup_strv_free_ char **binds_list = NULL, **overlays_list = NULL;
+                char **bind_path;
+
+                r = mount_compute_shallow_overlays(where, *extension, &binds_list, &overlays_list);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to compute overlays between %s and %s: %m", where, *extension);
+
+                if (!strv_isempty(overlays_list)) {
+                        _cleanup_free_ char *conflicting_dirs = NULL;
+
+                        /* Ignore OOM, it's more important to report the actual error */
+                        conflicting_dirs = strv_join(overlays_list, " ");
+
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "OverlayFS unavailable. Overlay between %s and %s cannot be set up with only bind mounts, conflicting directories: %s",
+                                               where, *extension, strnull(conflicting_dirs));
+                }
+
+                STRV_FOREACH(bind_path, binds_list) {
+                        _cleanup_free_ char *src = NULL, *dst = NULL;
+                        MountEntry m;
+
+                        src = path_join(*extension, *bind_path);
+                        dst = path_join(where, *bind_path);
+                        if (!src || !dst)
+                                return -ENOMEM;
+
+                        m = (MountEntry) {
+                                .source_const = src,
+                                .path_const = dst,
+                                .mode = BIND_MOUNT,
+                                .has_prefix = true,
+                                .read_only = true,
+                        };
+                        r = apply_one_mount(where, &m, ns_info);
+                        mount_entry_done(&m); /* chase_symlinks might change a _const to _malloc */
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        return 1;
+}
+
+static int mount_overlay(const MountEntry *m, const NamespaceInfo *ns_info) {
         const char *options;
         int r;
 
@@ -1139,6 +1202,8 @@ static int mount_overlay(const MountEntry *m) {
         r = mount_nofollow_verbose(LOG_DEBUG, "overlay", mount_entry_path(m), "overlay", MS_RDONLY, options);
         if (r == -ENOENT && m->ignore)
                 return 0;
+        if (r == -ENODEV)
+                return overlay_shallow_fallback(mount_entry_options(m), mount_entry_path(m), ns_info);
         if (r < 0)
                 return r;
 
@@ -1305,7 +1370,7 @@ static int apply_one_mount(
                 return mount_image(m, root_directory);
 
         case OVERLAY_MOUNT:
-                return mount_overlay(m);
+                return mount_overlay(m, ns_info);
 
         default:
                 assert_not_reached("Unknown mode");
